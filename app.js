@@ -6,6 +6,7 @@
     ["cpp", "C++"], ["csharp", "C#"], ["go", "Go"], ["rust", "Rust"],
     ["sql", "SQL"], ["html", "HTML"], ["css", "CSS"], ["plaintext", "Otro / texto plano"]
   ];
+  var POLL_INTERVAL_MS = 5000;
 
   function uid() { return "x" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
   function esc(s) {
@@ -17,27 +18,20 @@
     return type === "text" ? "Texto" : type === "code" ? "Código" : type === "image" ? "Imagen" : "PDF";
   }
 
-  // ── cookie-backed session storage for Supabase Auth ────────────────────
-  var COOKIE_MAX_AGE = 60 * 60 * 24 * 30; // 30 días
-  var cookieStorage = {
-    getItem: function (key) {
-      var m = document.cookie.match(new RegExp("(?:^|; )" + key.replace(/([.$?*|{}()\[\]\\\/+^])/g, "\\$1") + "=([^;]*)"));
-      return m ? decodeURIComponent(m[1]) : null;
-    },
-    setItem: function (key, value) {
-      var secure = location.protocol === "https:" ? "; Secure" : "";
-      document.cookie = key + "=" + encodeURIComponent(value) + "; max-age=" + COOKIE_MAX_AGE + "; path=/; SameSite=Lax" + secure;
-    },
-    removeItem: function (key) {
-      document.cookie = key + "=; max-age=0; path=/; SameSite=Lax";
+  // ── small fetch helper for the app's own API ────────────────────────
+  function apiFetch(url, options) {
+    options = options || {};
+    options.credentials = "same-origin";
+    if (options.body && !(options.body instanceof FormData)) {
+      options.headers = Object.assign({ "Content-Type": "application/json" }, options.headers);
     }
-  };
-
-  var supabaseClient = (window.supabase && window.SUPABASE_URL && window.SUPABASE_ANON_KEY)
-    ? window.supabase.createClient(window.SUPABASE_URL, window.SUPABASE_ANON_KEY, {
-        auth: { storage: cookieStorage, persistSession: true, autoRefreshToken: true, detectSessionInUrl: false }
-      })
-    : null;
+    return fetch(url, options).then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (data) {
+        if (!res.ok) throw new Error((data && data.error) || res.statusText);
+        return data;
+      });
+    });
+  }
 
   var state = {
     subjects: [],
@@ -64,71 +58,50 @@
     syncError: null
   };
 
-  function isAuthed() { return !!(state.session && state.session.user); }
+  function isAuthed() { return !!(state.session && state.session.email); }
 
-  // ── remote data (Supabase) ──────────────────────────────────────────
-  function rowToSubject(r) { return { id: r.id, name: r.name }; }
-  function rowToExercise(r) {
-    return {
-      id: r.id, subjectId: r.subject_id, code: r.code || "", topic: r.topic || "",
-      statement: r.statement || [], resolution: r.resolution || [], myAttempt: r.my_attempt || []
-    };
-  }
+  // ── remote data ──────────────────────────────────────────────────────
   function loadRemote() {
-    if (!supabaseClient) {
+    return Promise.all([apiFetch("/api/subjects"), apiFetch("/api/exercises")]).then(function (results) {
       state.loading = false;
-      state.syncError = "Backend no configurado: completá config.js con la URL y anon key de tu proyecto de Supabase.";
-      render();
-      return;
-    }
-    Promise.all([
-      supabaseClient.from("subjects").select("*").order("created_at"),
-      supabaseClient.from("exercises").select("*").order("created_at")
-    ]).then(function (results) {
-      var subjRes = results[0], exRes = results[1];
-      state.loading = false;
-      if (subjRes.error || exRes.error) {
-        state.syncError = "No se pudo sincronizar con el servidor.";
-        render();
-        return;
-      }
       state.syncError = null;
-      state.subjects = subjRes.data.map(rowToSubject);
-      state.exercises = exRes.data.map(rowToExercise);
+      state.subjects = results[0];
+      state.exercises = results[1];
+      render();
+    }).catch(function () {
+      state.loading = false;
+      state.syncError = "No se pudo sincronizar con el servidor.";
       render();
     });
   }
-  function subscribeRealtime() {
-    if (!supabaseClient) return;
-    supabaseClient.channel("public:banco-de-ejercicios")
-      .on("postgres_changes", { event: "*", schema: "public", table: "subjects" }, loadRemote)
-      .on("postgres_changes", { event: "*", schema: "public", table: "exercises" }, loadRemote)
-      .subscribe();
+  function startPolling() {
+    setInterval(function () {
+      if (document.hidden) return;
+      var active = document.activeElement;
+      // Don't yank focus/caret out from under someone mid-edit; retry next tick.
+      if (active && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) return;
+      loadRemote();
+    }, POLL_INTERVAL_MS);
   }
 
   // ── auth ─────────────────────────────────────────────────────────────
   function initAuth() {
-    if (!supabaseClient) return;
-    supabaseClient.auth.getSession().then(function (res) { state.session = res.data.session; render(); });
-    supabaseClient.auth.onAuthStateChange(function (event, session) { state.session = session; render(); });
+    apiFetch("/api/auth/me").then(function (data) { state.session = data.user; render(); }).catch(function () {});
   }
   function openAuth() { state.authOpen = true; state.authEmail = ""; state.authPassword = ""; state.authError = ""; render(); }
   function closeAuth() { state.authOpen = false; render(); }
   function signIn() {
-    if (!supabaseClient) { state.authError = "Backend no configurado."; render(); return; }
     if (!state.authEmail || !state.authPassword) { state.authError = "Completá email y contraseña."; render(); return; }
     state.authLoading = true; state.authError = ""; render();
-    supabaseClient.auth.signInWithPassword({ email: state.authEmail.trim(), password: state.authPassword }).then(function (res) {
-      state.authLoading = false;
-      if (res.error) { state.authError = "Credenciales inválidas."; render(); return; }
-      state.session = res.data.session;
-      state.authOpen = false;
-      render();
-    });
+    apiFetch("/api/auth/login", { method: "POST", body: JSON.stringify({ email: state.authEmail.trim(), password: state.authPassword }) })
+      .then(function (data) {
+        state.authLoading = false; state.session = data; state.authOpen = false;
+        render(); loadRemote();
+      })
+      .catch(function (err) { state.authLoading = false; state.authError = err.message || "Credenciales inválidas."; render(); });
   }
   function signOut() {
-    if (!supabaseClient) return;
-    supabaseClient.auth.signOut().then(function () { state.session = null; render(); });
+    apiFetch("/api/auth/logout", { method: "POST" }).then(function () { state.session = null; render(); });
   }
 
   // ── navigation ───────────────────────────────────────────────────────
@@ -150,18 +123,16 @@
     if (!name) return;
     state.addSubjectOpen = false; state.newSubjectName = "";
     render();
-    supabaseClient.from("subjects").insert({ name: name }).then(function (res) {
-      if (res.error) window.alert("Error al guardar: " + res.error.message);
-    });
+    apiFetch("/api/subjects", { method: "POST", body: JSON.stringify({ name: name }) })
+      .then(loadRemote).catch(function (err) { window.alert("Error al guardar: " + err.message); });
   }
   function deleteSubject(id) {
     if (!isAuthed()) return;
     if (!window.confirm("¿Eliminar esta materia y todos sus ejercicios?")) return;
     if (state.currentSubjectId === id) state.view = "home";
     render();
-    supabaseClient.from("subjects").delete().eq("id", id).then(function (res) {
-      if (res.error) window.alert("Error al eliminar: " + res.error.message);
-    });
+    apiFetch("/api/subjects/" + id, { method: "DELETE" })
+      .then(loadRemote).catch(function (err) { window.alert("Error al eliminar: " + err.message); });
   }
 
   // ── exercises ────────────────────────────────────────────────────────
@@ -185,11 +156,11 @@
     var returnView = state.formReturnView || "subject";
     var payload = { code: draft.code, topic: draft.topic, statement: draft.statement, resolution: draft.resolution };
     var req = editingId
-      ? supabaseClient.from("exercises").update(payload).eq("id", editingId)
-      : supabaseClient.from("exercises").insert(Object.assign({ subject_id: state.currentSubjectId, my_attempt: [] }, payload));
+      ? apiFetch("/api/exercises/" + editingId, { method: "PUT", body: JSON.stringify(payload) })
+      : apiFetch("/api/exercises", { method: "POST", body: JSON.stringify(Object.assign({ subjectId: state.currentSubjectId }, payload)) });
     state.view = returnView;
     render();
-    req.then(function (res) { if (res.error) window.alert("Error al guardar: " + res.error.message); });
+    req.then(loadRemote).catch(function (err) { window.alert("Error al guardar: " + err.message); });
   }
   function cancelForm() { state.view = state.formReturnView || "subject"; render(); }
   function deleteExercise(id) {
@@ -197,9 +168,8 @@
     if (!window.confirm("¿Eliminar este ejercicio? No se puede deshacer.")) return;
     if (state.view === "practice" && state.currentExerciseId === id) state.view = "subject";
     render();
-    supabaseClient.from("exercises").delete().eq("id", id).then(function (res) {
-      if (res.error) window.alert("Error al eliminar: " + res.error.message);
-    });
+    apiFetch("/api/exercises/" + id, { method: "DELETE" })
+      .then(loadRemote).catch(function (err) { window.alert("Error al eliminar: " + err.message); });
   }
 
   // ── practice ─────────────────────────────────────────────────────────
@@ -219,11 +189,9 @@
   function toggleAnswer() { state.showAnswer = !state.showAnswer; render(); }
   function saveAttempt() {
     if (!isAuthed()) return;
-    var draft = state.attemptDraft;
     var exId = state.currentExerciseId;
-    supabaseClient.from("exercises").update({ my_attempt: draft }).eq("id", exId).then(function (res) {
-      if (res.error) window.alert("Error al guardar: " + res.error.message);
-    });
+    apiFetch("/api/exercises/" + exId + "/attempt", { method: "PUT", body: JSON.stringify({ myAttempt: state.attemptDraft }) })
+      .then(loadRemote).catch(function (err) { window.alert("Error al guardar: " + err.message); });
   }
   function clearAttempt() {
     if (!isAuthed()) return;
@@ -231,9 +199,8 @@
     var exId = state.currentExerciseId;
     state.attemptDraft = [];
     render();
-    supabaseClient.from("exercises").update({ my_attempt: [] }).eq("id", exId).then(function (res) {
-      if (res.error) window.alert("Error al guardar: " + res.error.message);
-    });
+    apiFetch("/api/exercises/" + exId + "/attempt", { method: "PUT", body: JSON.stringify({ myAttempt: [] }) })
+      .then(loadRemote).catch(function (err) { window.alert("Error al guardar: " + err.message); });
   }
 
   // ── statement / resolution / attempt blocks ─────────────────────────
@@ -262,20 +229,19 @@
     render();
   }
   function updateBlockFile(section, id, file) {
-    if (!isAuthed() || !supabaseClient) return;
+    if (!isAuthed()) return;
     var b = getBlocks(section).find(function (b) { return b.id === id; });
     if (b) { b.uploading = true; b.uploadError = null; render(); }
-    var ext = (file.name.split(".").pop() || "bin").toLowerCase();
-    var path = state.session.user.id + "/" + uid() + "." + ext;
-    supabaseClient.storage.from("exercise-files").upload(path, file, { upsert: false }).then(function (res) {
+    var formData = new FormData();
+    formData.append("file", file);
+    apiFetch("/api/upload", { method: "POST", body: formData }).then(function (data) {
       var b2 = getBlocks(section).find(function (b) { return b.id === id; });
       if (!b2) return;
-      b2.uploading = false;
-      if (res.error) { b2.uploadError = res.error.message; render(); return; }
-      var pub = supabaseClient.storage.from("exercise-files").getPublicUrl(path);
-      b2.dataUrl = pub.data.publicUrl;
-      b2.fileName = file.name;
+      b2.uploading = false; b2.dataUrl = data.url; b2.fileName = file.name;
       render();
+    }).catch(function (err) {
+      var b2 = getBlocks(section).find(function (b) { return b.id === id; });
+      if (b2) { b2.uploading = false; b2.uploadError = err.message; render(); }
     });
   }
 
@@ -294,7 +260,7 @@
   function renderNav() {
     var showBack = state.view !== "home";
     var authControl = isAuthed()
-      ? '<span class="text-muted" style="font-size:13px">' + esc(state.session.user.email) + "</span>" +
+      ? '<span class="text-muted" style="font-size:13px">' + esc(state.session.email) + "</span>" +
         '<button class="btn btn-secondary" data-action="sign-out">Salir</button>'
       : '<button class="btn btn-secondary" data-action="open-auth">Iniciar sesión</button>';
     return (
@@ -665,7 +631,7 @@
     render();
     initAuth();
     loadRemote();
-    subscribeRealtime();
+    startPolling();
   }
 
   document.addEventListener("DOMContentLoaded", setup);
