@@ -1,4 +1,9 @@
 {
-  "subjects": [],
+  "subjects": [
+    {
+      "id": "xmsyu6z8a04yy97",
+      "name": "Algebra Lineal Computacional"
+    }
+  ],
   "exercises": []
 }
