@@ -12,6 +12,7 @@
   var COOKIE_MAX_AGE = 60 * 60 * 24 * 30; // 30 días
   var POLL_INTERVAL_MS = 15000;
   var POLL_INTERVAL_MS_ANON = 90000;
+  var WRITE_SUPPRESS_POLL_MS = 120000; // ver comentario en loadRemote()
 
   var LANGS = [
     ["javascript", "JavaScript"], ["python", "Python"], ["java", "Java"], ["c", "C"],
@@ -81,7 +82,7 @@
     return { "Authorization": "token " + state.session, "Accept": "application/vnd.github+json" };
   }
   function ghGetFile(path) {
-    return fetch(GH_API + "/contents/" + path + "?ref=" + GH_BRANCH, { headers: ghHeaders() }).then(function (res) {
+    return fetch(GH_API + "/contents/" + path + "?ref=" + GH_BRANCH, { headers: ghHeaders(), cache: "no-store" }).then(function (res) {
       if (res.status === 404) return null;
       if (!res.ok) return res.json().catch(function () { return null; }).then(function (d) {
         var e = new Error((d && d.message) || res.statusText); e.status = res.status; throw e;
@@ -103,8 +104,10 @@
       return res.json();
     });
   }
-  // Lee data/db.json (fresco, autenticado), aplica mutate(db) en memoria, y lo commitea.
-  // Reintenta una vez si el sha quedó desactualizado (409) por una escritura concurrente.
+  // Lee data/db.json (aplica mutate(db) en memoria) y lo commitea.
+  // api.github.com cachea las lecturas 60s (cache-control: s-maxage=60, no
+  // hay forma de evitarlo desde el cliente), así que dos escrituras seguidas
+  // pueden chocar contra un sha desactualizado; se reintenta un par de veces.
   function withDb(mutate, commitMessage) {
     function attempt(retriesLeft) {
       return ghGetFile(DB_PATH).then(function (file) {
@@ -114,6 +117,7 @@
           .then(function () {
             state.subjects = db.subjects;
             state.exercises = db.exercises;
+            state.lastWriteAt = Date.now();
             return result;
           })
           .catch(function (err) {
@@ -122,7 +126,7 @@
           });
       });
     }
-    return attempt(1);
+    return attempt(2);
   }
 
   var state = {
@@ -146,20 +150,26 @@
     authError: "",
     authLoading: false,
     loading: true,
-    syncError: null
+    syncError: null,
+    lastWriteAt: 0
   };
 
   function isAuthed() { return !!state.session; }
 
   // ── datos remotos (data/db.json en el repo) ─────────────────────────
-  // Se lee desde api.github.com (refleja un commit al instante) y no desde
-  // raw.githubusercontent.com: ese CDN cachea por path 5 minutos IGNORANDO
-  // el query string, así que un cache-busting ahí no sirve de nada y el
-  // siguiente poll pisaría con datos viejos la escritura que acabás de hacer.
+  // Se lee desde api.github.com en vez de raw.githubusercontent.com: ese CDN
+  // cachea por path 5 minutos IGNORANDO el query string (un cache-busting ahí
+  // no sirve de nada). api.github.com también cachea (cache-control: s-maxage=60,
+  // documentado, no evitable desde el cliente), así que justo después de
+  // escribir nosotros mismos NO conviene refrescar desde acá — el estado local
+  // ya quedó actualizado en withDb() con lo que realmente se commiteó, y un
+  // poll dentro de esa ventana de 60s pisaría eso con la respuesta cacheada
+  // (vieja). Ver WRITE_SUPPRESS_POLL_MS.
   function loadRemote() {
+    if (Date.now() - state.lastWriteAt < WRITE_SUPPRESS_POLL_MS) return Promise.resolve();
     var headers = { "Accept": "application/vnd.github+json" };
     if (isAuthed()) headers.Authorization = "token " + state.session;
-    return fetch(GH_API + "/contents/" + DB_PATH + "?ref=" + GH_BRANCH, { headers: headers }).then(function (res) {
+    return fetch(GH_API + "/contents/" + DB_PATH + "?ref=" + GH_BRANCH, { headers: headers, cache: "no-store" }).then(function (res) {
       if (!res.ok) throw new Error("HTTP " + res.status);
       return res.json();
     }).then(function (data) {
