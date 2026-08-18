@@ -11,6 +11,7 @@
   var TOKEN_COOKIE = "gh_token";
   var COOKIE_MAX_AGE = 60 * 60 * 24 * 30; // 30 días
   var POLL_INTERVAL_MS = 15000;
+  var POLL_INTERVAL_MS_ANON = 90000;
 
   var LANGS = [
     ["javascript", "JavaScript"], ["python", "Python"], ["java", "Java"], ["c", "C"],
@@ -151,11 +152,18 @@
   function isAuthed() { return !!state.session; }
 
   // ── datos remotos (data/db.json en el repo) ─────────────────────────
+  // Se lee desde api.github.com (refleja un commit al instante) y no desde
+  // raw.githubusercontent.com: ese CDN cachea por path 5 minutos IGNORANDO
+  // el query string, así que un cache-busting ahí no sirve de nada y el
+  // siguiente poll pisaría con datos viejos la escritura que acabás de hacer.
   function loadRemote() {
-    return fetch(GH_RAW + "/" + DB_PATH + "?cb=" + Date.now()).then(function (res) {
+    var headers = { "Accept": "application/vnd.github+json" };
+    if (isAuthed()) headers.Authorization = "token " + state.session;
+    return fetch(GH_API + "/contents/" + DB_PATH + "?ref=" + GH_BRANCH, { headers: headers }).then(function (res) {
       if (!res.ok) throw new Error("HTTP " + res.status);
       return res.json();
-    }).then(function (db) {
+    }).then(function (data) {
+      var db = JSON.parse(b64ToUtf8(data.content));
       state.loading = false;
       state.syncError = null;
       state.subjects = db.subjects || [];
@@ -167,12 +175,19 @@
       render();
     });
   }
+  var lastPollAt = 0;
   function startPolling() {
     setInterval(function () {
       if (document.hidden) return;
       var active = document.activeElement;
       // Don't yank focus/caret out from under someone mid-edit; retry next tick.
       if (active && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) return;
+      // Sin sesión, las lecturas van sin auth contra la API de GitHub (60/hora
+      // por IP) — se espacian más para no agotar ese límite entre varios
+      // visitantes. Con sesión, el límite autenticado (5000/hora) sobra.
+      var minGap = isAuthed() ? POLL_INTERVAL_MS : POLL_INTERVAL_MS_ANON;
+      if (Date.now() - lastPollAt < minGap) return;
+      lastPollAt = Date.now();
       loadRemote();
     }, POLL_INTERVAL_MS);
   }
