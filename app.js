@@ -1,12 +1,22 @@
 (function () {
   "use strict";
 
+  var GH_OWNER = "carchaves";
+  var GH_REPO = "FundacionII";
+  var GH_BRANCH = "main";
+  var GH_API = "https://api.github.com/repos/" + GH_OWNER + "/" + GH_REPO;
+  var GH_RAW = "https://raw.githubusercontent.com/" + GH_OWNER + "/" + GH_REPO + "/" + GH_BRANCH;
+  var DB_PATH = "data/db.json";
+  var MAX_FILE_MB = 5;
+  var TOKEN_COOKIE = "gh_token";
+  var COOKIE_MAX_AGE = 60 * 60 * 24 * 30; // 30 días
+  var POLL_INTERVAL_MS = 15000;
+
   var LANGS = [
     ["javascript", "JavaScript"], ["python", "Python"], ["java", "Java"], ["c", "C"],
     ["cpp", "C++"], ["csharp", "C#"], ["go", "Go"], ["rust", "Rust"],
     ["sql", "SQL"], ["html", "HTML"], ["css", "CSS"], ["plaintext", "Otro / texto plano"]
   ];
-  var POLL_INTERVAL_MS = 5000;
 
   function uid() { return "x" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
   function esc(s) {
@@ -18,19 +28,100 @@
     return type === "text" ? "Texto" : type === "code" ? "Código" : type === "image" ? "Imagen" : "PDF";
   }
 
-  // ── small fetch helper for the app's own API ────────────────────────
-  function apiFetch(url, options) {
-    options = options || {};
-    options.credentials = "same-origin";
-    if (options.body && !(options.body instanceof FormData)) {
-      options.headers = Object.assign({ "Content-Type": "application/json" }, options.headers);
-    }
-    return fetch(url, options).then(function (res) {
-      return res.json().catch(function () { return null; }).then(function (data) {
-        if (!res.ok) throw new Error((data && data.error) || res.statusText);
-        return data;
+  // ── cookies (persiste el token descifrado, no la contraseña) ───────────
+  function setCookie(name, value) {
+    var secure = location.protocol === "https:" ? "; Secure" : "";
+    document.cookie = name + "=" + encodeURIComponent(value) + "; max-age=" + COOKIE_MAX_AGE + "; path=/; SameSite=Lax" + secure;
+  }
+  function getCookie(name) {
+    var m = document.cookie.match(new RegExp("(?:^|; )" + name + "=([^;]*)"));
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+  function clearCookie(name) {
+    document.cookie = name + "=; max-age=0; path=/; SameSite=Lax";
+  }
+
+  // ── base64 helpers (UTF-8 seguro, para textos con tildes/ñ) ─────────────
+  function b64ToBytes(b64) {
+    var binary = atob(b64.replace(/\n/g, ""));
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+  function b64ToUtf8(b64) { return new TextDecoder("utf-8").decode(b64ToBytes(b64)); }
+  function utf8ToB64(str) {
+    var bytes = new TextEncoder().encode(str);
+    var binary = "";
+    for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  }
+
+  // ── descifrado del token (PBKDF2 + AES-GCM, ver scripts/generate-secrets.js) ──
+  function decryptToken(password) {
+    var auth = window.__GH_AUTH__;
+    if (!auth) return Promise.reject(new Error("Falta secrets.generated.js (correr scripts/generate-secrets.js)."));
+    var enc = new TextEncoder();
+    var salt = b64ToBytes(auth.saltB64);
+    var iv = b64ToBytes(auth.ivB64);
+    var cipher = b64ToBytes(auth.cipherB64);
+    return crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"])
+      .then(function (baseKey) {
+        return crypto.subtle.deriveKey(
+          { name: "PBKDF2", salt: salt, iterations: auth.iterations, hash: "SHA-256" },
+          baseKey, { name: "AES-GCM", length: 256 }, false, ["decrypt"]
+        );
+      })
+      .then(function (key) { return crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, key, cipher); })
+      .then(function (plainBuf) { return new TextDecoder().decode(plainBuf); });
+  }
+
+  // ── API de contenidos de GitHub (lecturas públicas vía raw, escrituras autenticadas) ──
+  function ghHeaders() {
+    return { "Authorization": "token " + state.session, "Accept": "application/vnd.github+json" };
+  }
+  function ghGetFile(path) {
+    return fetch(GH_API + "/contents/" + path + "?ref=" + GH_BRANCH, { headers: ghHeaders() }).then(function (res) {
+      if (res.status === 404) return null;
+      if (!res.ok) return res.json().catch(function () { return null; }).then(function (d) {
+        var e = new Error((d && d.message) || res.statusText); e.status = res.status; throw e;
       });
+      return res.json().then(function (data) { return { sha: data.sha, content: b64ToUtf8(data.content) }; });
     });
+  }
+  function ghPutFile(path, content, message, sha, isBase64) {
+    var body = { message: message, content: isBase64 ? content : utf8ToB64(content), branch: GH_BRANCH };
+    if (sha) body.sha = sha;
+    return fetch(GH_API + "/contents/" + path, {
+      method: "PUT",
+      headers: Object.assign({ "Content-Type": "application/json" }, ghHeaders()),
+      body: JSON.stringify(body)
+    }).then(function (res) {
+      if (!res.ok) return res.json().catch(function () { return null; }).then(function (d) {
+        var e = new Error((d && d.message) || res.statusText); e.status = res.status; throw e;
+      });
+      return res.json();
+    });
+  }
+  // Lee data/db.json (fresco, autenticado), aplica mutate(db) en memoria, y lo commitea.
+  // Reintenta una vez si el sha quedó desactualizado (409) por una escritura concurrente.
+  function withDb(mutate, commitMessage) {
+    function attempt(retriesLeft) {
+      return ghGetFile(DB_PATH).then(function (file) {
+        var db = file ? JSON.parse(file.content) : { subjects: [], exercises: [] };
+        var result = mutate(db);
+        return ghPutFile(DB_PATH, JSON.stringify(db, null, 2), commitMessage, file ? file.sha : null)
+          .then(function () {
+            state.subjects = db.subjects;
+            state.exercises = db.exercises;
+            return result;
+          })
+          .catch(function (err) {
+            if (err.status === 409 && retriesLeft > 0) return attempt(retriesLeft - 1);
+            throw err;
+          });
+      });
+    }
+    return attempt(1);
   }
 
   var state = {
@@ -50,7 +141,6 @@
     copiedId: null,
     session: null,
     authOpen: false,
-    authEmail: "",
     authPassword: "",
     authError: "",
     authLoading: false,
@@ -58,19 +148,22 @@
     syncError: null
   };
 
-  function isAuthed() { return !!(state.session && state.session.email); }
+  function isAuthed() { return !!state.session; }
 
-  // ── remote data ──────────────────────────────────────────────────────
+  // ── datos remotos (data/db.json en el repo) ─────────────────────────
   function loadRemote() {
-    return Promise.all([apiFetch("/api/subjects"), apiFetch("/api/exercises")]).then(function (results) {
+    return fetch(GH_RAW + "/" + DB_PATH + "?cb=" + Date.now()).then(function (res) {
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return res.json();
+    }).then(function (db) {
       state.loading = false;
       state.syncError = null;
-      state.subjects = results[0];
-      state.exercises = results[1];
+      state.subjects = db.subjects || [];
+      state.exercises = db.exercises || [];
       render();
     }).catch(function () {
       state.loading = false;
-      state.syncError = "No se pudo sincronizar con el servidor.";
+      state.syncError = "No se pudo sincronizar con GitHub.";
       render();
     });
   }
@@ -86,22 +179,32 @@
 
   // ── auth ─────────────────────────────────────────────────────────────
   function initAuth() {
-    apiFetch("/api/auth/me").then(function (data) { state.session = data.user; render(); }).catch(function () {});
+    var token = getCookie(TOKEN_COOKIE);
+    if (!token) return;
+    state.session = token;
+    render();
+    fetch(GH_API, { headers: ghHeaders() }).then(function (res) {
+      if (!res.ok) { state.session = null; clearCookie(TOKEN_COOKIE); render(); }
+    }).catch(function () {});
   }
-  function openAuth() { state.authOpen = true; state.authEmail = ""; state.authPassword = ""; state.authError = ""; render(); }
+  function openAuth() { state.authOpen = true; state.authPassword = ""; state.authError = ""; render(); }
   function closeAuth() { state.authOpen = false; render(); }
   function signIn() {
-    if (!state.authEmail || !state.authPassword) { state.authError = "Completá email y contraseña."; render(); return; }
+    if (!state.authPassword) { state.authError = "Ingresá la contraseña."; render(); return; }
     state.authLoading = true; state.authError = ""; render();
-    apiFetch("/api/auth/login", { method: "POST", body: JSON.stringify({ email: state.authEmail.trim(), password: state.authPassword }) })
-      .then(function (data) {
-        state.authLoading = false; state.session = data; state.authOpen = false;
-        render(); loadRemote();
-      })
-      .catch(function (err) { state.authLoading = false; state.authError = err.message || "Credenciales inválidas."; render(); });
+    decryptToken(state.authPassword).then(function (token) {
+      state.authLoading = false; state.session = token; state.authOpen = false; state.authPassword = "";
+      setCookie(TOKEN_COOKIE, token);
+      render(); loadRemote();
+    }).catch(function () {
+      state.authLoading = false; state.authError = "Contraseña incorrecta.";
+      render();
+    });
   }
   function signOut() {
-    apiFetch("/api/auth/logout", { method: "POST" }).then(function () { state.session = null; render(); });
+    state.session = null;
+    clearCookie(TOKEN_COOKIE);
+    render();
   }
 
   // ── navigation ───────────────────────────────────────────────────────
@@ -123,16 +226,18 @@
     if (!name) return;
     state.addSubjectOpen = false; state.newSubjectName = "";
     render();
-    apiFetch("/api/subjects", { method: "POST", body: JSON.stringify({ name: name }) })
-      .then(loadRemote).catch(function (err) { window.alert("Error al guardar: " + err.message); });
+    withDb(function (db) { db.subjects = db.subjects.concat([{ id: uid(), name: name }]); }, "Agregar materia: " + name)
+      .then(render).catch(function (err) { window.alert("Error al guardar: " + err.message); });
   }
   function deleteSubject(id) {
     if (!isAuthed()) return;
     if (!window.confirm("¿Eliminar esta materia y todos sus ejercicios?")) return;
     if (state.currentSubjectId === id) state.view = "home";
     render();
-    apiFetch("/api/subjects/" + id, { method: "DELETE" })
-      .then(loadRemote).catch(function (err) { window.alert("Error al eliminar: " + err.message); });
+    withDb(function (db) {
+      db.subjects = db.subjects.filter(function (s) { return s.id !== id; });
+      db.exercises = db.exercises.filter(function (e) { return e.subjectId !== id; });
+    }, "Eliminar materia").then(render).catch(function (err) { window.alert("Error al eliminar: " + err.message); });
   }
 
   // ── exercises ────────────────────────────────────────────────────────
@@ -153,14 +258,23 @@
     if (!isAuthed()) return;
     var draft = state.formDraft;
     var editingId = state.editingExerciseId;
+    var subjectId = state.currentSubjectId;
     var returnView = state.formReturnView || "subject";
-    var payload = { code: draft.code, topic: draft.topic, statement: draft.statement, resolution: draft.resolution };
-    var req = editingId
-      ? apiFetch("/api/exercises/" + editingId, { method: "PUT", body: JSON.stringify(payload) })
-      : apiFetch("/api/exercises", { method: "POST", body: JSON.stringify(Object.assign({ subjectId: state.currentSubjectId }, payload)) });
     state.view = returnView;
     render();
-    req.then(loadRemote).catch(function (err) { window.alert("Error al guardar: " + err.message); });
+    withDb(function (db) {
+      if (editingId) {
+        db.exercises = db.exercises.map(function (e) {
+          return e.id === editingId ? Object.assign({}, e, { code: draft.code, topic: draft.topic, statement: draft.statement, resolution: draft.resolution }) : e;
+        });
+      } else {
+        db.exercises = db.exercises.concat([{
+          id: uid(), subjectId: subjectId, code: draft.code, topic: draft.topic,
+          statement: draft.statement, resolution: draft.resolution, myAttempt: []
+        }]);
+      }
+    }, (editingId ? "Editar ejercicio " : "Agregar ejercicio ") + (draft.code || ""))
+      .then(render).catch(function (err) { window.alert("Error al guardar: " + err.message); });
   }
   function cancelForm() { state.view = state.formReturnView || "subject"; render(); }
   function deleteExercise(id) {
@@ -168,8 +282,8 @@
     if (!window.confirm("¿Eliminar este ejercicio? No se puede deshacer.")) return;
     if (state.view === "practice" && state.currentExerciseId === id) state.view = "subject";
     render();
-    apiFetch("/api/exercises/" + id, { method: "DELETE" })
-      .then(loadRemote).catch(function (err) { window.alert("Error al eliminar: " + err.message); });
+    withDb(function (db) { db.exercises = db.exercises.filter(function (e) { return e.id !== id; }); }, "Eliminar ejercicio")
+      .then(render).catch(function (err) { window.alert("Error al eliminar: " + err.message); });
   }
 
   // ── practice ─────────────────────────────────────────────────────────
@@ -190,8 +304,10 @@
   function saveAttempt() {
     if (!isAuthed()) return;
     var exId = state.currentExerciseId;
-    apiFetch("/api/exercises/" + exId + "/attempt", { method: "PUT", body: JSON.stringify({ myAttempt: state.attemptDraft }) })
-      .then(loadRemote).catch(function (err) { window.alert("Error al guardar: " + err.message); });
+    var draft = state.attemptDraft;
+    withDb(function (db) {
+      db.exercises = db.exercises.map(function (e) { return e.id === exId ? Object.assign({}, e, { myAttempt: draft }) : e; });
+    }, "Guardar resolución propia").then(render).catch(function (err) { window.alert("Error al guardar: " + err.message); });
   }
   function clearAttempt() {
     if (!isAuthed()) return;
@@ -199,8 +315,9 @@
     var exId = state.currentExerciseId;
     state.attemptDraft = [];
     render();
-    apiFetch("/api/exercises/" + exId + "/attempt", { method: "PUT", body: JSON.stringify({ myAttempt: [] }) })
-      .then(loadRemote).catch(function (err) { window.alert("Error al guardar: " + err.message); });
+    withDb(function (db) {
+      db.exercises = db.exercises.map(function (e) { return e.id === exId ? Object.assign({}, e, { myAttempt: [] }) : e; });
+    }, "Borrar resolución propia").then(render).catch(function (err) { window.alert("Error al guardar: " + err.message); });
   }
 
   // ── statement / resolution / attempt blocks ─────────────────────────
@@ -231,18 +348,29 @@
   function updateBlockFile(section, id, file) {
     if (!isAuthed()) return;
     var b = getBlocks(section).find(function (b) { return b.id === id; });
-    if (b) { b.uploading = true; b.uploadError = null; render(); }
-    var formData = new FormData();
-    formData.append("file", file);
-    apiFetch("/api/upload", { method: "POST", body: formData }).then(function (data) {
-      var b2 = getBlocks(section).find(function (b) { return b.id === id; });
-      if (!b2) return;
-      b2.uploading = false; b2.dataUrl = data.url; b2.fileName = file.name;
+    if (!b) return;
+    if (file.size > MAX_FILE_MB * 1024 * 1024) {
+      b.uploadError = "El archivo es demasiado grande (máx " + MAX_FILE_MB + "MB).";
       render();
-    }).catch(function (err) {
-      var b2 = getBlocks(section).find(function (b) { return b.id === id; });
-      if (b2) { b2.uploading = false; b2.uploadError = err.message; render(); }
-    });
+      return;
+    }
+    b.uploading = true; b.uploadError = null; render();
+    var reader = new FileReader();
+    reader.onload = function () {
+      var base64 = String(reader.result).split(",")[1];
+      var ext = (file.name.split(".").pop() || "bin").toLowerCase();
+      var filePath = "data/files/" + uid() + "." + ext;
+      ghPutFile(filePath, base64, "Adjuntar archivo: " + file.name, null, true).then(function () {
+        var b2 = getBlocks(section).find(function (b) { return b.id === id; });
+        if (!b2) return;
+        b2.uploading = false; b2.dataUrl = GH_RAW + "/" + filePath; b2.fileName = file.name;
+        render();
+      }).catch(function (err) {
+        var b2 = getBlocks(section).find(function (b) { return b.id === id; });
+        if (b2) { b2.uploading = false; b2.uploadError = err.message; render(); }
+      });
+    };
+    reader.readAsDataURL(file);
   }
 
   var copyTimer = null;
@@ -260,7 +388,7 @@
   function renderNav() {
     var showBack = state.view !== "home";
     var authControl = isAuthed()
-      ? '<span class="text-muted" style="font-size:13px">' + esc(state.session.email) + "</span>" +
+      ? '<span class="text-muted" style="font-size:13px">Sesión iniciada</span>' +
         '<button class="btn btn-secondary" data-action="sign-out">Salir</button>'
       : '<button class="btn btn-secondary" data-action="open-auth">Iniciar sesión</button>';
     return (
@@ -532,10 +660,8 @@
       '<div class="dialog" data-action="stop-prop">' +
       '<div class="dialog-title">Iniciar sesión</div>' +
       (state.authError ? '<p style="font-size:13px;margin:0;color:var(--color-accent-800)">' + esc(state.authError) + "</p>" : "") +
-      '<div class="field"><label>Email</label>' +
-      '<input class="input" type="email" data-action="auth-email" value="' + esc(state.authEmail) + '" placeholder="tu@email.com" /></div>' +
       '<div class="field"><label>Contraseña</label>' +
-      '<input class="input" type="password" data-action="auth-password" value="' + esc(state.authPassword) + '" placeholder="••••••••" /></div>' +
+      '<input class="input" type="password" data-action="auth-password" value="' + esc(state.authPassword) + '" placeholder="••••••••" autofocus /></div>' +
       '<div class="dialog-actions">' +
       '<button class="btn btn-secondary" data-action="close-auth">Cancelar</button>' +
       '<button class="btn btn-primary" data-action="sign-in"' + (state.authLoading ? " disabled" : "") + ">" + (state.authLoading ? "Ingresando…" : "Ingresar") + "</button>" +
@@ -616,7 +742,6 @@
       if (el.dataset.action === "block-text") updateBlockText(el.dataset.section, el.dataset.id, el.value);
       else if (el.dataset.action === "draft-field") state.formDraft[el.dataset.field] = el.value;
       else if (el.dataset.action === "new-subject-name") state.newSubjectName = el.value;
-      else if (el.dataset.action === "auth-email") state.authEmail = el.value;
       else if (el.dataset.action === "auth-password") state.authPassword = el.value;
     });
 
@@ -624,7 +749,7 @@
       if (e.key !== "Enter") return;
       var el = e.target.closest("[data-action]");
       if (!el) return;
-      if (el.dataset.action === "auth-email" || el.dataset.action === "auth-password") signIn();
+      if (el.dataset.action === "auth-password") signIn();
       else if (el.dataset.action === "new-subject-name") confirmAddSubject();
     });
 
