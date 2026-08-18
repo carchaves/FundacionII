@@ -1,4 +1,9 @@
 {
-  "subjects": [],
+  "subjects": [
+    {
+      "id": "xmsy4bda8s3uk2x",
+      "name": "smoke test"
+    }
+  ],
   "exercises": []
 }
