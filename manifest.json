@@ -1,0 +1,25 @@
+{
+  "name": "Fundación II",
+  "short_name": "Fundación II",
+  "description": "Banco de ejercicios de Fundación II",
+  "start_url": "/FundacionII/",
+  "scope": "/FundacionII/",
+  "display": "standalone",
+  "background_color": "#f2f2f3",
+  "theme_color": "#4f8c86",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "share_target": {
+    "action": "/FundacionII/share-target.html",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "files": [
+        { "name": "sharedImage", "accept": ["image/*"] }
+      ]
+    }
+  }
+}

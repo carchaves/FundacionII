@@ -13,6 +13,8 @@
   var POLL_INTERVAL_MS = 15000;
   var POLL_INTERVAL_MS_ANON = 90000;
   var WRITE_SUPPRESS_POLL_MS = 120000; // ver comentario en loadRemote()
+  var SHARE_DB_NAME = "fundacion2-share";
+  var SHARE_STORE_NAME = "shared";
 
   var LANGS = [
     ["javascript", "JavaScript"], ["python", "Python"], ["java", "Java"], ["c", "C"],
@@ -151,7 +153,8 @@
     authLoading: false,
     loading: true,
     syncError: null,
-    lastWriteAt: 0
+    lastWriteAt: 0,
+    pendingSharedFile: null
   };
 
   function isAuthed() { return !!state.session; }
@@ -230,6 +233,44 @@
     state.session = null;
     clearCookie(TOKEN_COOKIE);
     render();
+  }
+
+  // ── compartir imagen desde otra app (Web Share Target, ver sw.js) ────
+  function registerServiceWorker() {
+    if (!("serviceWorker" in navigator)) return;
+    navigator.serviceWorker.register("sw.js").catch(function () {});
+  }
+  function openShareDb() {
+    return new Promise(function (resolve, reject) {
+      var req = indexedDB.open(SHARE_DB_NAME, 1);
+      req.onupgradeneeded = function () { req.result.createObjectStore(SHARE_STORE_NAME, { keyPath: "id" }); };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }
+  // Si venimos de compartir una imagen desde otra app (sw.js dejó el archivo
+  // en IndexedDB y redirigió acá con ?shared=1), lo toma, lo borra (consumo
+  // único) y lo deja listo en state.pendingSharedFile para que el usuario
+  // elija la materia.
+  function checkPendingShare() {
+    var params = new URLSearchParams(location.search);
+    var shared = params.get("shared");
+    if (!shared) return;
+    history.replaceState(null, "", location.pathname);
+    if (shared !== "1") { state.syncError = "No se pudo recibir la imagen compartida, probá de nuevo."; render(); return; }
+    openShareDb().then(function (db) {
+      var tx = db.transaction(SHARE_STORE_NAME, "readwrite");
+      var req = tx.objectStore(SHARE_STORE_NAME).get("pending");
+      req.onsuccess = function () {
+        var record = req.result;
+        if (record && record.file) tx.objectStore(SHARE_STORE_NAME).delete("pending");
+        tx.oncomplete = function () {
+          if (!record || !record.file) return;
+          state.pendingSharedFile = new File([record.file], record.name || "compartido.png", { type: record.type || "image/png" });
+          if (!isAuthed()) openAuth(); else render();
+        };
+      };
+    }).catch(function () {});
   }
 
   // ── navigation ───────────────────────────────────────────────────────
@@ -352,6 +393,14 @@
     if (!isAuthed()) return;
     setBlocks(section, getBlocks(section).concat([{ id: uid(), type: type, text: "", language: "javascript", dataUrl: null }]));
     render();
+  }
+  // Crea un bloque de imagen y arranca la subida en el mismo paso (pegado, compartido desde el celular).
+  function addBlockWithFile(section, file) {
+    if (!isAuthed()) return;
+    var blk = { id: uid(), type: "image", text: "", language: "javascript", dataUrl: null };
+    setBlocks(section, getBlocks(section).concat([blk]));
+    render();
+    updateBlockFile(section, blk.id, file);
   }
   function removeBlock(section, id) {
     if (!isAuthed()) return;
@@ -501,13 +550,14 @@
   }
 
   function renderHome() {
+    var sharing = !!state.pendingSharedFile && isAuthed();
     var cards = state.subjects.map(function (sub) {
       var count = state.exercises.filter(function (e) { return e.subjectId === sub.id; }).length;
       var countLabel = count === 0 ? "Sin ejercicios" : count + (count === 1 ? " ejercicio" : " ejercicios");
       return (
-        '<div class="blueprint" style="aspect-ratio:1;display:flex;flex-direction:column;justify-content:space-between;padding:var(--space-4);cursor:pointer;position:relative" data-action="open-subject" data-id="' + sub.id + '">' +
+        '<div class="blueprint" style="aspect-ratio:1;display:flex;flex-direction:column;justify-content:space-between;padding:var(--space-4);cursor:pointer;position:relative" data-action="' + (sharing ? "use-shared-image" : "open-subject") + '" data-id="' + sub.id + '">' +
         '<i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>' +
-        (isAuthed() ?
+        (isAuthed() && !sharing ?
           '<button class="btn btn-icon" style="position:absolute;top:6px;right:6px;color:var(--color-accent-700)" data-action="delete-subject" data-id="' + sub.id + '" title="Eliminar materia">' +
           '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m2 0v14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V6h12z"></path></svg>' +
           "</button>" : "") +
@@ -515,14 +565,20 @@
         '<div class="card-meta" style="justify-content:center">' + countLabel + "</div></div>"
       );
     }).join("");
+    var shareBanner = sharing ?
+      '<div class="blueprint" style="padding:var(--space-4);margin-bottom:var(--space-6);display:flex;justify-content:space-between;align-items:center;gap:var(--space-3);flex-wrap:wrap">' +
+      '<i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>' +
+      '<span>Imagen recibida — tocá la materia para crear el ejercicio con esa imagen ya cargada.</span>' +
+      '<button class="btn btn-secondary" data-action="cancel-shared-image">Cancelar</button></div>' : "";
     return (
       '<div style="padding:var(--space-8) var(--space-6);max-width:1200px;margin:0 auto">' +
       "<h1>Materias</h1>" +
       '<p class="text-muted" style="margin-bottom:var(--space-6)">Elegí una materia para ver, cargar o practicar ejercicios.</p>' +
+      shareBanner +
       (state.loading ? '<p class="text-muted">Cargando…</p>' :
       '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:var(--space-6)">' +
       cards +
-      (isAuthed() ?
+      (isAuthed() && !sharing ?
         '<div class="blueprint" style="aspect-ratio:1;display:flex;align-items:center;justify-content:center;cursor:pointer;border-style:dashed;gap:8px;color:var(--color-accent-700)" data-action="open-add-subject">' +
         '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>' +
         '<span style="font-family:var(--font-heading);font-weight:600">Agregar materia</span></div>' : "") +
@@ -601,12 +657,16 @@
       "</div>" +
 
       "<h3>Enunciado</h3>" +
+      '<div data-paste-section="statement">' +
       draft.statement.map(function (b) { return renderEditableBlock("statement", b); }).join("") +
       renderAddButtons("statement") +
+      "</div>" +
 
       "<h3>Resolución</h3>" +
+      '<div data-paste-section="resolution">' +
       draft.resolution.map(function (b) { return renderEditableBlock("resolution", b); }).join("") +
       renderAddButtons("resolution") +
+      "</div>" +
 
       '<div style="display:flex;gap:var(--space-2)">' +
       '<button class="btn btn-primary" data-action="save-form">Guardar ejercicio</button>' +
@@ -747,6 +807,20 @@
             if (blk) copyCode(blk.id, blk.text);
           }
           break;
+        case "use-shared-image":
+          if (!isAuthed() || !state.pendingSharedFile) return;
+          var sharedFile = state.pendingSharedFile;
+          state.pendingSharedFile = null;
+          state.currentSubjectId = id;
+          state.view = "form"; state.editingExerciseId = null; state.formReturnView = "subject";
+          state.formDraft = { code: "", topic: "", statement: [], resolution: [] };
+          render();
+          addBlockWithFile("statement", sharedFile);
+          break;
+        case "cancel-shared-image":
+          state.pendingSharedFile = null;
+          render();
+          break;
       }
     });
 
@@ -778,10 +852,31 @@
       else if (el.dataset.action === "new-subject-name") confirmAddSubject();
     });
 
+    // Pegar una imagen copiada (Ctrl+V) directo en el formulario de ejercicio,
+    // sin pasar por el selector de archivos.
+    app.addEventListener("paste", function (e) {
+      if (state.view !== "form" || !isAuthed()) return;
+      var items = (e.clipboardData || window.clipboardData) && (e.clipboardData || window.clipboardData).items;
+      if (!items) return;
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].type.indexOf("image") === 0) {
+          e.preventDefault();
+          var file = items[i].getAsFile();
+          if (!file) return;
+          var zone = e.target.closest("[data-paste-section]");
+          var section = zone ? zone.dataset.pasteSection : "statement";
+          addBlockWithFile(section, file);
+          return;
+        }
+      }
+    });
+
     render();
     initAuth();
+    checkPendingShare();
     loadRemote();
     startPolling();
+    registerServiceWorker();
   }
 
   document.addEventListener("DOMContentLoaded", setup);
